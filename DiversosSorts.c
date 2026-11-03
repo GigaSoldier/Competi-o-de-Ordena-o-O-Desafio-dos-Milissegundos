@@ -1,11 +1,18 @@
 /*
  * Benchmark de ordenacao - versao paralela (OpenMP) e otimizada.
  *
- * Compilar (GCC / MinGW-w64 / Linux):
- *   gcc -O3 -march=native -funroll-loops -flto -fopenmp DiversosSorts.c -o DiversosSorts
+ * Alvo x86-64-v3: AVX2 + BMI1/BMI2 + FMA + LZCNT + MOVBE + F16C (Intel Haswell /
+ * AMD Excavator/Zen ou mais novos). Os kernels AVX2 sao compilados quando o
+ * compilador define __AVX2__; sem isso o programa usa as versoes escalares.
+ *
+ * Compilar (GCC 11+ / Clang 12+ / MinGW-w64 / Linux):
+ *   gcc -O3 -march=x86-64-v3 -funroll-loops -flto -fopenmp DiversosSorts_1.c -o DiversosSorts
+ *   (GCC mais antigo: -mavx2 -mbmi -mbmi2 -mlzcnt -mfma -mmovbe -mf16c)
+ *   No GCC, mesmo sem -march o proprio codigo liga o conjunto v3 (pragma);
+ *   para desligar isso e usar so codigo escalar: -DSEM_V3
  *
  * Compilar (MSVC, Developer Command Prompt):
- *   cl /O2 /openmp /arch:AVX2 DiversosSorts.c
+ *   cl /O2 /openmp /arch:AVX2 DiversosSorts_1.c
  *
  * Executar (basta rodar: ja testa TODOS os algoritmos, sem precisar de flag):
  *   DiversosSorts                      (usa listaOdenada.txt)
@@ -47,6 +54,19 @@ static void omp_set_num_threads(int n) { (void)n; }
 static void omp_set_dynamic(int d)     { (void)d; }
 #endif
 
+/* ------------------------------------------------------------------ */
+/* x86-64-v3 (AVX2, BMI2, LZCNT...)                                    */
+/* ------------------------------------------------------------------ */
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(SEM_V3)
+#  if defined(__GNUC__) && !defined(__clang__) && !defined(__AVX2__)
+#    pragma GCC target("avx2,bmi,bmi2,lzcnt,fma,movbe,f16c")
+#  endif
+#  if defined(__AVX2__)
+#    include <immintrin.h>
+#    define USA_AVX2 1
+#  endif
+#endif
+
 typedef int value_t;
 
 #define MAX_T 256
@@ -80,6 +100,17 @@ static double agora_ms(void) {
     return omp_get_wtime() * 1000.0;
 #else
     return 1000.0 * (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
+
+/* Numero de bits necessarios para x (0 -> 0). Vira LZCNT em x86-64-v3. */
+static inline int bits_de(uint32_t x) {
+#if defined(__GNUC__)
+    return x ? 32 - __builtin_clz(x) : 0;
+#else
+    int b = 0;
+    for (; x; x >>= 1) ++b;
+    return b;
 #endif
 }
 
@@ -119,12 +150,31 @@ static Assinatura assinatura(const value_t *v, size_t n) {
     return a;
 }
 
+/* Confere os pares (i-1, i) para i em [a, b). */
+static int bloco_ordenado(const value_t *v, size_t a, size_t b) {
+    size_t i = a;
+#ifdef USA_AVX2
+    for (; i + 8 <= b; i += 8) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(v + i - 1));
+        __m256i y = _mm256_loadu_si256((const __m256i *)(v + i));
+        if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(x, y))) return 0;
+    }
+#endif
+    for (; i < b; ++i)
+        if (v[i - 1] > v[i]) return 0;
+    return 1;
+}
+
 static int esta_ordenado(const value_t *v, size_t n) {
     int ok = 1;
-    long long cnt = (long long)n;
-#pragma omp parallel for reduction(&:ok) schedule(static) if(cnt > 100000)
-    for (long long i = 1; i < cnt; ++i)
-        ok &= (v[i - 1] <= v[i]);
+    int T = threads_para(n);
+#pragma omp parallel num_threads(T) reduction(&:ok)
+    {
+        int t = omp_get_thread_num(), nt = omp_get_num_threads();
+        size_t a = particao(n, t, nt), b = particao(n, t + 1, nt);
+        if (a < 1) a = 1;
+        ok &= bloco_ordenado(v, a, b);
+    }
     return ok;
 }
 
@@ -148,6 +198,45 @@ static void copia_paralela(value_t *dst, const value_t *src, size_t n, int T) {
     }
 }
 
+/* Minimo e maximo de v[a, b). AVX2: 4 acumuladores x 8 inteiros por iteracao. */
+static void minmax_bloco(const value_t *v, size_t a, size_t b, value_t *lo_out, value_t *hi_out) {
+    value_t lo = INT_MAX, hi = INT_MIN;
+    size_t i = a;
+#ifdef USA_AVX2
+    if (b - a >= 32) {
+        __m256i l0 = _mm256_set1_epi32(INT_MAX), l1 = l0, l2 = l0, l3 = l0;
+        __m256i h0 = _mm256_set1_epi32(INT_MIN), h1 = h0, h2 = h0, h3 = h0;
+        for (; i + 32 <= b; i += 32) {
+            __m256i x0 = _mm256_loadu_si256((const __m256i *)(v + i));
+            __m256i x1 = _mm256_loadu_si256((const __m256i *)(v + i + 8));
+            __m256i x2 = _mm256_loadu_si256((const __m256i *)(v + i + 16));
+            __m256i x3 = _mm256_loadu_si256((const __m256i *)(v + i + 24));
+            l0 = _mm256_min_epi32(l0, x0); h0 = _mm256_max_epi32(h0, x0);
+            l1 = _mm256_min_epi32(l1, x1); h1 = _mm256_max_epi32(h1, x1);
+            l2 = _mm256_min_epi32(l2, x2); h2 = _mm256_max_epi32(h2, x2);
+            l3 = _mm256_min_epi32(l3, x3); h3 = _mm256_max_epi32(h3, x3);
+        }
+        l0 = _mm256_min_epi32(_mm256_min_epi32(l0, l1), _mm256_min_epi32(l2, l3));
+        h0 = _mm256_max_epi32(_mm256_max_epi32(h0, h1), _mm256_max_epi32(h2, h3));
+        __m128i l = _mm_min_epi32(_mm256_castsi256_si128(l0), _mm256_extracti128_si256(l0, 1));
+        __m128i h = _mm_max_epi32(_mm256_castsi256_si128(h0), _mm256_extracti128_si256(h0, 1));
+        l = _mm_min_epi32(l, _mm_shuffle_epi32(l, _MM_SHUFFLE(1, 0, 3, 2)));
+        l = _mm_min_epi32(l, _mm_shuffle_epi32(l, _MM_SHUFFLE(2, 3, 0, 1)));
+        h = _mm_max_epi32(h, _mm_shuffle_epi32(h, _MM_SHUFFLE(1, 0, 3, 2)));
+        h = _mm_max_epi32(h, _mm_shuffle_epi32(h, _MM_SHUFFLE(2, 3, 0, 1)));
+        lo = _mm_cvtsi128_si32(l);
+        hi = _mm_cvtsi128_si32(h);
+    }
+#endif
+    for (; i < b; ++i) {
+        value_t x = v[i];
+        lo = x < lo ? x : lo;
+        hi = x > hi ? x : hi;
+    }
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
 static void minmax_par(const value_t *v, size_t n, int T, value_t *mn, value_t *mx) {
     value_t mins[MAX_T], maxs[MAX_T];
     int usados = 1;
@@ -155,12 +244,8 @@ static void minmax_par(const value_t *v, size_t n, int T, value_t *mn, value_t *
     {
         int t = omp_get_thread_num(), nt = omp_get_num_threads();
         size_t a = particao(n, t, nt), b = particao(n, t + 1, nt);
-        value_t lo = INT_MAX, hi = INT_MIN;
-        for (size_t i = a; i < b; ++i) {
-            value_t x = v[i];
-            lo = x < lo ? x : lo;
-            hi = x > hi ? x : hi;
-        }
+        value_t lo, hi;
+        minmax_bloco(v, a, b, &lo, &hi);
         mins[t] = lo;
         maxs[t] = hi;
         if (t == 0) usados = nt;
@@ -260,16 +345,72 @@ static value_t *carregar_arquivo(const char *caminho, size_t *n_out) {
 /* ------------------------------------------------------------------ */
 
 static void insertion_sort(value_t *v, size_t inicio, size_t fim);
+static void merge_seq(const value_t *A, size_t na, const value_t *B, size_t nb, value_t *out);
 
+#ifdef USA_AVX2
+#define CORTE_INS 64 /* folhas de 64 inteiros ordenadas com rede AVX2 */
+
+#define CE(a, b) do { __m256i t_ = _mm256_min_epi32(a, b); b = _mm256_max_epi32(a, b); a = t_; } while (0)
+
+/* Transposicao 8x8 de inteiros de 32 bits. */
+static inline void transpor8x8(__m256i *r) {
+    __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]), t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]), t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+    __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
+    __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
+    __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
+    __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
+    r[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
+    r[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+    r[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
+    r[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+    r[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
+    r[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+    r[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
+    r[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+}
+
+/* Ordena 64 inteiros em p (scratch: outros 64 inteiros, sobrescritos).
+ * 1) rede de 19 comparadores ordena as 8 colunas ao mesmo tempo (min/max AVX2);
+ * 2) transpoe: viram 8 corridas ordenadas de 8; 3) 3 merges escalares sem desvio. */
+static void sort64_avx2(value_t *p, value_t *scratch) {
+    __m256i r[8];
+    for (int i = 0; i < 8; ++i) r[i] = _mm256_loadu_si256((const __m256i *)(p + 8 * i));
+    CE(r[0], r[2]); CE(r[1], r[3]); CE(r[4], r[6]); CE(r[5], r[7]);
+    CE(r[0], r[4]); CE(r[1], r[5]); CE(r[2], r[6]); CE(r[3], r[7]);
+    CE(r[0], r[1]); CE(r[2], r[3]); CE(r[4], r[5]); CE(r[6], r[7]);
+    CE(r[2], r[4]); CE(r[3], r[5]);
+    CE(r[1], r[4]); CE(r[3], r[6]);
+    CE(r[1], r[2]); CE(r[3], r[4]); CE(r[5], r[6]);
+    transpor8x8(r);
+    for (int i = 0; i < 8; ++i) _mm256_storeu_si256((__m256i *)(scratch + 8 * i), r[i]);
+    for (int k = 0; k < 4; ++k) merge_seq(scratch + 16 * k, 8, scratch + 16 * k + 8, 8, p + 16 * k);
+    for (int k = 0; k < 2; ++k) merge_seq(p + 32 * k, 16, p + 32 * k + 16, 16, scratch + 32 * k);
+    merge_seq(scratch, 32, scratch + 32, 32, p);
+}
+#else
 #define CORTE_INS 32 /* abaixo disso o Insertion Sort e mais rapido que dividir */
+#endif
 
 /* Merge Sort "ping-pong": src e dst tem o mesmo conteudo em [ini, fim) na
  * entrada; ao final a faixa ordenada esta em dst. Alternar os papeis dos dois
  * vetores evita copiar de volta a cada nivel da recursao. */
 static void msort_pp(value_t *dst, value_t *src, size_t ini, size_t fim) {
-    if (fim - ini <= CORTE_INS) { insertion_sort(dst, ini, fim); return; }
+    if (fim - ini <= CORTE_INS) {
+#ifdef USA_AVX2
+        if (fim - ini == 64) { sort64_avx2(dst + ini, src + ini); return; }
+#endif
+        insertion_sort(dst, ini, fim);
+        return;
+    }
 
+#ifdef USA_AVX2
+    size_t meio = ini + (((fim - ini) / 2 + 32) / 64) * 64;   /* folhas de exatamente 64 */
+#else
     size_t meio = ini + (fim - ini) / 2;
+#endif
     msort_pp(src, dst, ini, meio);
     msort_pp(src, dst, meio, fim);
 
@@ -389,9 +530,13 @@ static void introsort_rec(value_t *v, size_t inicio, size_t fim, int profundidad
 }
 
 static int log2_piso(size_t x) {
+#if defined(__GNUC__)
+    return x ? 63 - __builtin_clzll((unsigned long long)x) : 0;
+#else
     int p = 0;
     for (; x > 1; x >>= 1) ++p;
     return p;
+#endif
 }
 
 static void introsort(value_t *v, size_t n) {
@@ -448,6 +593,52 @@ static void introsort_paralelo(value_t *v, size_t n) {
  *  3. prefixo sequencial minusculo entre as fatias;
  *  4. cada thread escreve sua fatia ja ordenada no vetor final.
  * Retorna -1 se a faixa de valores for grande demais (use o Radix). */
+/* dst[i] += src[i] (somar histogramas das threads) */
+static void hist_somar(uint32_t *dst, const uint32_t *src, size_t n) {
+    size_t i = 0;
+#ifdef USA_AVX2
+    for (; i + 8 <= n; i += 8) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(dst + i));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_add_epi32(a, b));
+    }
+#endif
+    for (; i < n; ++i) dst[i] += src[i];
+}
+
+/* Soma dos n contadores (acumula em 64 bits). */
+static size_t hist_total(const uint32_t *h, size_t n) {
+    size_t i = 0, s = 0;
+#ifdef USA_AVX2
+    __m256i acc = _mm256_setzero_si256();
+    for (; i + 8 <= n; i += 8) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(h + i));
+        acc = _mm256_add_epi64(acc, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(x)));
+        acc = _mm256_add_epi64(acc, _mm256_cvtepu32_epi64(_mm256_extracti128_si256(x, 1)));
+    }
+    uint64_t t[4];
+    _mm256_storeu_si256((__m256i *)t, acc);
+    s = (size_t)(t[0] + t[1] + t[2] + t[3]);
+#endif
+    for (; i < n; ++i) s += h[i];
+    return s;
+}
+
+/* dst[0, cnt) = val. Corridas longas: stores AVX2 de 32 bytes (o ultimo
+ * sobrepoe o anterior, sempre dentro de [dst, dst+cnt)). */
+static inline void preencher(value_t *dst, value_t val, size_t cnt) {
+    size_t j = 0;
+#ifdef USA_AVX2
+    if (cnt >= 16) {
+        __m256i vv = _mm256_set1_epi32(val);
+        for (; j + 8 <= cnt; j += 8) _mm256_storeu_si256((__m256i *)(dst + j), vv);
+        if (j < cnt) _mm256_storeu_si256((__m256i *)(dst + cnt - 8), vv);
+        return;
+    }
+#endif
+    for (; j < cnt; ++j) dst[j] = val;
+}
+
 static int ordenar_contagem(value_t *v, size_t n, Workspace *ws) {
     if (n < 2) return 0;
     if (n >= 0xFFFFFFFFu) return -1;
@@ -479,13 +670,9 @@ static int ordenar_contagem(value_t *v, size_t n, Workspace *ws) {
 #pragma omp barrier
 
         size_t va = particao(R, t, nt), vb = particao(R, t + 1, nt);
-        for (int k = 1; k < nt; ++k) {
-            const uint32_t *hk = H + (size_t)k * R;
-            for (size_t x = va; x < vb; ++x) H[x] += hk[x];
-        }
-        size_t soma = 0;
-        for (size_t x = va; x < vb; ++x) soma += H[x];
-        fatia[t] = soma;
+        for (int k = 1; k < nt; ++k)
+            hist_somar(H + va, H + (size_t)k * R + va, vb - va);
+        fatia[t] = hist_total(H + va, vb - va);
 #pragma omp barrier
 #pragma omp single
         {
@@ -497,7 +684,7 @@ static int ordenar_contagem(value_t *v, size_t n, Workspace *ws) {
         for (size_t x = va; x < vb; ++x) {
             uint32_t c = H[x];
             value_t val = (value_t)((uint32_t)x + mnu);
-            for (uint32_t j = 0; j < c; ++j) v[pos + j] = val;
+            preencher(v + pos, val, c);
             pos += c;
         }
     }
@@ -521,8 +708,7 @@ static int ordenar_radix(value_t *v, value_t *aux, size_t n, Workspace *ws) {
     uint32_t maxkey = (uint32_t)mx - mnu;
     if (maxkey == 0) return 0;
 
-    int bits = 0;
-    for (uint32_t m = maxkey; m; m >>= 1) ++bits;
+    int bits = bits_de(maxkey);
     int passes = (bits + 10) / 11;
     int bpp = (bits + passes - 1) / passes;
     size_t radix = (size_t)1 << bpp;
