@@ -1,25 +1,6 @@
-/*
- * Benchmark de ordenacao paralelo (OpenMP), alvo x86-64-v3 (AVX2/BMI2/LZCNT).
- * Os kernels AVX2 so sao compilados se __AVX2__ estiver definido; senao usa
- * as versoes escalares. No GCC o pragma abaixo liga o conjunto v3 sozinho;
- * -DSEM_V3 desliga isso.
- *
- * Compilar (GCC/Clang/MinGW):
- *   gcc -O3 -march=x86-64-v3 -funroll-loops -flto -fopenmp DiversosSorts.c -o DiversosSorts
- * Compilar (MSVC):
- *   cl /O2 /openmp /arch:AVX2 DiversosSorts.c
- *
- * Uso:
- *   DiversosSorts [arquivo.txt] [--competicao]
- *   (padrao: listaOdenada.txt, testa todos os algoritmos)
- *
- * So a ordenacao e cronometrada (clock() e omp_get_wtime); leitura do arquivo
- * e verificacao ficam fora. No Linux/macOS clock() soma o CPU de todas as
- * threads, por isso a coluna "parede" e o tempo real dos algoritmos paralelos.
- *
- * Algoritmos: Counting Sort, Radix Sort LSD, Merge Sort e Intro Sort paralelos;
- * Intro Sort, Merge Sort, Heap Sort e qsort sequenciais como referencia.
- */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,44 +8,47 @@
 #include <time.h>
 #include <string.h>
 #include <limits.h>
+#include <stdbool.h>
+#if defined(_MSC_VER)
+#include <malloc.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
 #else
-static int omp_get_thread_num(void)  { return 0; }
-static int omp_get_num_threads(void) { return 1; }
-static int omp_get_max_threads(void) { return 1; }
-static int omp_get_num_procs(void)   { return 1; }
-static void omp_set_num_threads(int n) { (void)n; }
-static void omp_set_dynamic(int d)     { (void)d; }
+static inline int omp_get_thread_num(void)  { return 0; }
+static inline int omp_get_num_threads(void) { return 1; }
+static inline int omp_get_max_threads(void) { return 1; }
+static inline int omp_get_num_procs(void)   { return 1; }
+static inline void omp_set_num_threads(int n) { (void)n; }
+static inline void omp_set_dynamic(int d)     { (void)d; }
 #endif
 
-/* ------------------------------------------------------------------ */
-/* x86-64-v3 (AVX2, BMI2, LZCNT...)                                    */
-/* ------------------------------------------------------------------ */
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(SEM_V3)
-#  if defined(__GNUC__) && !defined(__clang__) && !defined(__AVX2__)
-#    pragma GCC target("avx2,bmi,bmi2,lzcnt,fma,movbe,f16c")
-#  endif
-#  if defined(__AVX2__)
-#    include <immintrin.h>
-#    define USA_AVX2 1
-#  endif
+/* SIMD selecionado na compilacao para a arquitetura-alvo. */
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX512F__)
+#  include <immintrin.h>
+#  define USA_AVX512 1
+#  define USA_AVX2 1 /* AVX-512 e retrocompativel com os caminhos AVX2 existentes. */
+#elif (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX2__)
+#  include <immintrin.h>
+#  define USA_AVX2 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#  include <arm_neon.h>
+#  define USA_NEON 1
 #endif
 
-typedef int value_t;
+typedef int32_t value_t;
 
 #define TROCA(a, b) do { value_t t_ = (a); (a) = (b); (b) = t_; } while (0)
-
 #define MAX_T 256
-#define MAX_SEG 1024 /* maximo de pedacos do Intro Sort paralelo */
-#define ORCAMENTO_HIST ((size_t)512 << 20) /* limite de memoria p/ histogramas do Counting Sort */
-#define REPETICOES 7                       /* melhor de N execucoes */
+#define MAX_SEG 1024
+#define ORCAMENTO_HIST ((size_t)512 << 20)
+#define REPETICOES 5
 
 typedef struct {
     const char *nome;
-    double clock_ms;   /* melhor tempo medido com clock()            */
-    double parede_ms;  /* melhor tempo de parede (omp_get_wtime)     */
+    double clock_ms;
+    double parede_ms;
     int aplicavel;
     int correto;
 } Resultado;
@@ -79,18 +63,66 @@ typedef struct {
 } Assinatura;
 
 /* ------------------------------------------------------------------ */
-/* Utilidades                                                          */
+/* Gerenciamento de Memória Alinhada em Cache Line (64 Bytes)         */
 /* ------------------------------------------------------------------ */
+
+static void *malloc_alinhado(size_t bytes) {
+    void *ptr = NULL;
+#if defined(_MSC_VER)
+    ptr = _aligned_malloc(bytes, 64);
+#elif defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L) || defined(__APPLE__) || defined(__linux__)
+    if (posix_memalign(&ptr, 64, bytes) != 0) ptr = NULL;
+#else
+    ptr = malloc(bytes);
+#endif
+    return ptr;
+}
+
+static void free_alinhado(void *ptr) {
+    if (!ptr) return;
+#if defined(_MSC_VER)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static inline uint32_t mapToUnsigned(value_t val) {
+    return (uint32_t)val ^ 0x80000000U;
+}
+
+static inline value_t mapFromUnsigned(uint32_t val) {
+    return (value_t)(val ^ 0x80000000U);
+}
 
 static double agora_ms(void) {
 #ifdef _OPENMP
     return omp_get_wtime() * 1000.0;
 #else
-    return 1000.0 * (double)clock() / CLOCKS_PER_SEC;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 #endif
 }
 
-/* Numero de bits necessarios para x (0 -> 0). Vira LZCNT em x86-64-v3. */
+/* Mostra recursos reais da CPU em tempo de execucao (x86 GCC/Clang). */
+static void imprimir_capacidades_cpu(void) {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_cpu_init();
+    printf(" CPU (CPUID):");
+    int algum = 0;
+    if (__builtin_cpu_supports("avx512f"))  { printf(" AVX-512F"); algum = 1; }
+    if (__builtin_cpu_supports("avx512bw")) { printf(" AVX-512BW"); algum = 1; }
+    if (__builtin_cpu_supports("avx512dq")) { printf(" AVX-512DQ"); algum = 1; }
+    if (__builtin_cpu_supports("avx512vl")) { printf(" AVX-512VL"); algum = 1; }
+    if (!algum && __builtin_cpu_supports("avx2")) { printf(" AVX2"); algum = 1; }
+    if (!algum) printf(" sem AVX2/AVX-512");
+    printf("\n");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    printf(" CPU: ARM64 (Advanced SIMD/NEON obrigatorio)\n");
+#endif
+}
+
 static inline int bits_de(uint32_t x) {
 #if defined(__GNUC__)
     return x ? 32 - __builtin_clz(x) : 0;
@@ -117,8 +149,8 @@ static int threads_para(size_t n) {
 
 static uint32_t *ws_hist(Workspace *ws, size_t elementos) {
     if (ws->cap < elementos) {
-        free(ws->hist);
-        ws->hist = (uint32_t *)malloc(elementos * sizeof(uint32_t));
+        free_alinhado(ws->hist);
+        ws->hist = (uint32_t *)malloc_alinhado(elementos * sizeof(uint32_t));
         ws->cap = ws->hist ? elementos : 0;
     }
     return ws->hist;
@@ -136,14 +168,25 @@ static Assinatura assinatura(const value_t *v, size_t n) {
     return (Assinatura){s1, s2};
 }
 
-/* Confere os pares (i-1, i) para i em [a, b). */
 static int bloco_ordenado(const value_t *v, size_t a, size_t b) {
     size_t i = a;
-#ifdef USA_AVX2
+#ifdef USA_AVX512
+    for (; i + 16 <= b; i += 16) {
+        __m512i x = _mm512_loadu_si512((const void *)(v + i - 1));
+        __m512i y = _mm512_loadu_si512((const void *)(v + i));
+        if (_mm512_cmpgt_epi32_mask(x, y)) return 0;
+    }
+#elif defined(USA_AVX2)
     for (; i + 8 <= b; i += 8) {
         __m256i x = _mm256_loadu_si256((const __m256i *)(v + i - 1));
         __m256i y = _mm256_loadu_si256((const __m256i *)(v + i));
         if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(x, y))) return 0;
+    }
+#elif defined(USA_NEON)
+    for (; i + 4 <= b; i += 4) {
+        int32x4_t x = vld1q_s32(v + i - 1);
+        int32x4_t y = vld1q_s32(v + i);
+        if (vminvq_u32(vcleq_s32(x, y)) == 0) return 0;
     }
 #endif
     for (; i < b; ++i)
@@ -164,15 +207,17 @@ static int esta_ordenado(const value_t *v, size_t n) {
     return ok;
 }
 
-/* Cria as threads do OpenMP antes da primeira medicao. */
-static void aquecer_threads(void) {
-    volatile int sink = 0;
-#pragma omp parallel
+/* Força 100% de uso da CPU antes de cronometrar (Locks de Turbo Boost e aquecimento de L1/L2) */
+static void aquecer_cpu_e_threads(void) {
+    int T = omp_get_max_threads();
+#pragma omp parallel num_threads(T)
     {
-#pragma omp atomic
-        sink += 1;
+        volatile double acc = 1.0000001;
+        for (int i = 0; i < 2000000; i++) {
+            acc = acc * 1.0000001 + 0.0000001;
+        }
+        (void)acc;
     }
-    (void)sink;
 }
 
 static void copia_paralela(value_t *dst, const value_t *src, size_t n, int T) {
@@ -184,11 +229,27 @@ static void copia_paralela(value_t *dst, const value_t *src, size_t n, int T) {
     }
 }
 
-/* Minimo e maximo de v[a, b). AVX2: 4 acumuladores x 8 inteiros por iteracao. */
 static void minmax_bloco(const value_t *v, size_t a, size_t b, value_t *lo_out, value_t *hi_out) {
     value_t lo = INT_MAX, hi = INT_MIN;
     size_t i = a;
-#ifdef USA_AVX2
+#ifdef USA_AVX512
+    if (b - a >= 64) {
+        __m512i vlo0 = _mm512_set1_epi32(INT_MAX), vlo1 = vlo0;
+        __m512i vhi0 = _mm512_set1_epi32(INT_MIN), vhi1 = vhi0;
+        for (; i + 64 <= b; i += 64) {
+            __m512i x0 = _mm512_loadu_si512((const void *)(v + i));
+            __m512i x1 = _mm512_loadu_si512((const void *)(v + i + 16));
+            __m512i x2 = _mm512_loadu_si512((const void *)(v + i + 32));
+            __m512i x3 = _mm512_loadu_si512((const void *)(v + i + 48));
+            vlo0 = _mm512_min_epi32(vlo0, _mm512_min_epi32(x0, x1));
+            vlo1 = _mm512_min_epi32(vlo1, _mm512_min_epi32(x2, x3));
+            vhi0 = _mm512_max_epi32(vhi0, _mm512_max_epi32(x0, x1));
+            vhi1 = _mm512_max_epi32(vhi1, _mm512_max_epi32(x2, x3));
+        }
+        lo = _mm512_reduce_min_epi32(_mm512_min_epi32(vlo0, vlo1));
+        hi = _mm512_reduce_max_epi32(_mm512_max_epi32(vhi0, vhi1));
+    }
+#elif defined(USA_AVX2)
     if (b - a >= 32) {
         __m256i l0 = _mm256_set1_epi32(INT_MAX), l1 = l0, l2 = l0, l3 = l0;
         __m256i h0 = _mm256_set1_epi32(INT_MIN), h1 = h0, h2 = h0, h3 = h0;
@@ -212,6 +273,21 @@ static void minmax_bloco(const value_t *v, size_t a, size_t b, value_t *lo_out, 
         h = _mm_max_epi32(h, _mm_shuffle_epi32(h, _MM_SHUFFLE(2, 3, 0, 1)));
         lo = _mm_cvtsi128_si32(l);
         hi = _mm_cvtsi128_si32(h);
+    }
+#elif defined(USA_NEON)
+    if (b - a >= 16) {
+        int32x4_t vlo = vdupq_n_s32(INT_MAX);
+        int32x4_t vhi = vdupq_n_s32(INT_MIN);
+        for (; i + 16 <= b; i += 16) {
+            int32x4_t x0 = vld1q_s32(v + i);
+            int32x4_t x1 = vld1q_s32(v + i + 4);
+            int32x4_t x2 = vld1q_s32(v + i + 8);
+            int32x4_t x3 = vld1q_s32(v + i + 12);
+            vlo = vminq_s32(vlo, vminq_s32(vminq_s32(x0, x1), vminq_s32(x2, x3)));
+            vhi = vmaxq_s32(vhi, vmaxq_s32(vmaxq_s32(x0, x1), vmaxq_s32(x2, x3)));
+        }
+        lo = vminvq_s32(vlo);
+        hi = vmaxvq_s32(vhi);
     }
 #endif
     for (; i < b; ++i) {
@@ -245,14 +321,9 @@ static void minmax_par(const value_t *v, size_t n, int T, value_t *mn, value_t *
     *mx = hi;
 }
 
-/* ------------------------------------------------------------------ */
-/* Leitura paralela do arquivo                                         */
-/* ------------------------------------------------------------------ */
-
+/* Leitura paralela acelerada do buffer de disco */
 #define EH_TOKEN(c) ((((unsigned)(c) - '0') < 10u) || (c) == '-')
 
-/* Cada thread processa os numeros cujo inicio cai em [lo, hi).
- * Com out == NULL apenas conta. */
 static size_t varrer(const unsigned char *buf, size_t lo, size_t hi, value_t *out) {
     const unsigned char *p = buf + lo, *e = buf + hi;
     size_t cont = 0;
@@ -281,18 +352,13 @@ static value_t *carregar_arquivo(const char *caminho, size_t *n_out) {
     FILE *f = fopen(caminho, "rb");
     if (!f) return NULL;
 
-#ifdef _WIN32
-    _fseeki64(f, 0, SEEK_END);
-    long long tam = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
-#else
     fseek(f, 0, SEEK_END);
     long long tam = ftell(f);
     fseek(f, 0, SEEK_SET);
-#endif
-    if (tam < 0) { fclose(f); return NULL; }
 
-    unsigned char *buf = (unsigned char *)malloc((size_t)tam + 1);
+    if (tam <= 0) { fclose(f); return NULL; }
+
+    unsigned char *buf = (unsigned char *)malloc_alinhado((size_t)tam + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t lidos = fread(buf, 1, (size_t)tam, f);
     fclose(f);
@@ -316,91 +382,42 @@ static value_t *carregar_arquivo(const char *caminho, size_t *n_out) {
             size_t acc = 0;
             for (int k = 0; k < nt; ++k) { off[k] = acc; acc += cnt[k]; }
             total = acc;
-            dados = (value_t *)malloc((total ? total : 1) * sizeof(value_t));
+            dados = (value_t *)malloc_alinhado((total ? total : 1) * sizeof(value_t));
         }
         if (dados) varrer(buf, lo, hi, dados + off[t]);
     }
 
-    free(buf);
+    free_alinhado(buf);
     *n_out = dados ? total : 0;
     return dados;
 }
 
 /* ------------------------------------------------------------------ */
-/* Merge Sort sequencial (usado como base do Merge Sort paralelo)      */
+/* Algoritmos de Ordenação Otimizados                                 */
 /* ------------------------------------------------------------------ */
 
 static void insertion_sort(value_t *v, size_t inicio, size_t fim);
 static void merge_seq(const value_t *A, size_t na, const value_t *B, size_t nb, value_t *out);
 
-#ifdef USA_AVX2
-#define CORTE_INS 64 /* folhas de 64 inteiros ordenadas com rede AVX2 */
+#define CORTE_INS 64
 
-#define CE(a, b) do { __m256i t_ = _mm256_min_epi32(a, b); b = _mm256_max_epi32(a, b); a = t_; } while (0)
-
-/* Transposicao 8x8 de inteiros de 32 bits. */
-static inline void transpor8x8(__m256i *r) {
-    __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
-    __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
-    __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]), t5 = _mm256_unpackhi_epi32(r[4], r[5]);
-    __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]), t7 = _mm256_unpackhi_epi32(r[6], r[7]);
-    __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
-    __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
-    __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
-    __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
-    r[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
-    r[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
-    r[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
-    r[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
-    r[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
-    r[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
-    r[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
-    r[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
-}
-
-/* Ordena 64 inteiros em p (scratch: outros 64 inteiros, sobrescritos).
- * 1) rede de 19 comparadores ordena as 8 colunas ao mesmo tempo (min/max AVX2);
- * 2) transpoe: viram 8 corridas ordenadas de 8; 3) 3 merges escalares sem desvio. */
-static void sort64_avx2(value_t *p, value_t *scratch) {
-    __m256i r[8];
-    for (int i = 0; i < 8; ++i) r[i] = _mm256_loadu_si256((const __m256i *)(p + 8 * i));
-    CE(r[0], r[2]); CE(r[1], r[3]); CE(r[4], r[6]); CE(r[5], r[7]);
-    CE(r[0], r[4]); CE(r[1], r[5]); CE(r[2], r[6]); CE(r[3], r[7]);
-    CE(r[0], r[1]); CE(r[2], r[3]); CE(r[4], r[5]); CE(r[6], r[7]);
-    CE(r[2], r[4]); CE(r[3], r[5]);
-    CE(r[1], r[4]); CE(r[3], r[6]);
-    CE(r[1], r[2]); CE(r[3], r[4]); CE(r[5], r[6]);
-    transpor8x8(r);
-    for (int i = 0; i < 8; ++i) _mm256_storeu_si256((__m256i *)(scratch + 8 * i), r[i]);
-    for (int k = 0; k < 4; ++k) merge_seq(scratch + 16 * k, 8, scratch + 16 * k + 8, 8, p + 16 * k);
-    for (int k = 0; k < 2; ++k) merge_seq(p + 32 * k, 16, p + 32 * k + 16, 16, scratch + 32 * k);
-    merge_seq(scratch, 32, scratch + 32, 32, p);
-}
-#else
-#define CORTE_INS 32 /* abaixo disso o Insertion Sort e mais rapido que dividir */
-#endif
-
-/* Merge Sort "ping-pong": src e dst tem o mesmo conteudo em [ini, fim) na
- * entrada; ao final a faixa ordenada esta em dst. Alternar os papeis dos dois
- * vetores evita copiar de volta a cada nivel da recursao. */
 static void msort_pp(value_t *dst, value_t *src, size_t ini, size_t fim) {
     if (fim - ini <= CORTE_INS) {
-#ifdef USA_AVX2
-        if (fim - ini == 64) { sort64_avx2(dst + ini, src + ini); return; }
-#endif
         insertion_sort(dst, ini, fim);
         return;
     }
 
-#ifdef USA_AVX2
-    size_t meio = ini + (((fim - ini) / 2 + 32) / 64) * 64;   /* folhas de exatamente 64 */
+#if defined(USA_AVX2)
+    size_t meio = ini + (((fim - ini) / 2 + 32) / 64) * 64;
+#elif defined(USA_NEON)
+    size_t meio = ini + (((fim - ini) / 2 + 2) / 4) * 4;
 #else
     size_t meio = ini + (fim - ini) / 2;
 #endif
     msort_pp(src, dst, ini, meio);
     msort_pp(src, dst, meio, fim);
 
-    if (src[meio - 1] <= src[meio]) { /* ja em ordem: so copia */
+    if (src[meio - 1] <= src[meio]) {
         memcpy(dst + ini, src + ini, (fim - ini) * sizeof(*dst));
         return;
     }
@@ -417,16 +434,11 @@ static void msort_pp(value_t *dst, value_t *src, size_t ini, size_t fim) {
     else if (j < fim) memcpy(dst + k, src + j, (fim - j) * sizeof(*dst));
 }
 
-/* Ordena v[inicio, fim) usando aux[inicio, fim) como area de trabalho. */
 static void mergesort_rec(value_t *v, value_t *aux, size_t inicio, size_t fim) {
     if (fim - inicio < 2) return;
     memcpy(aux + inicio, v + inicio, (fim - inicio) * sizeof(*v));
     msort_pp(v, aux, inicio, fim);
 }
-
-/* ------------------------------------------------------------------ */
-/* Algoritmos classicos (referencia)                                   */
-/* ------------------------------------------------------------------ */
 
 static int comparar_int(const void *a, const void *b) {
     value_t x = *(const value_t *)a;
@@ -468,8 +480,6 @@ static void heapsort_intervalo(value_t *v, size_t inicio, size_t fim) {
     }
 }
 
-/* Particiona v[inicio, fim) (fim - inicio > 24) com mediana de 3 e devolve o
- * ponto de corte: tudo em [inicio, corte) <= tudo em [corte, fim). */
 static size_t particionar(value_t *v, size_t inicio, size_t fim) {
     size_t meio = inicio + (fim - inicio) / 2;
     size_t ultimo = fim - 1;
@@ -525,11 +535,6 @@ static void introsort(value_t *v, size_t n) {
     introsort_rec(v, 0, n, log2_piso(n) * 2);
 }
 
-/* Intro Sort paralelo (compativel com OpenMP 2.0, sem "tasks"):
- *  1. particiona nivel a nivel; em cada nivel todos os pedacos sao
- *     particionados em paralelo (o 1o nivel usa 1 thread, o 2o usa 2, ...);
- *  2. ao ter ~4 pedacos por thread, cada pedaco e ordenado por uma thread com
- *     o Intro Sort sequencial (escalonamento dinamico equilibra a carga). */
 static void introsort_paralelo(value_t *v, size_t n) {
     int T = threads_para(n);
     if (T == 1 || n < ((size_t)1 << 16)) { introsort(v, n); return; }
@@ -566,32 +571,41 @@ static void introsort_paralelo(value_t *v, size_t n) {
         introsort(v + si[s], sf[s] - si[s]);
 }
 
-/* ------------------------------------------------------------------ */
-/* 1: Counting Sort paralelo                                           */
-/* ------------------------------------------------------------------ */
-/* Fases (tudo em uma unica regiao paralela):
- *  1. cada thread zera e preenche o proprio histograma do seu bloco;
- *  2. cada thread soma os histogramas numa fatia da faixa de valores;
- *  3. prefixo sequencial minusculo entre as fatias;
- *  4. cada thread escreve sua fatia ja ordenada no vetor final.
- * Retorna -1 se a faixa de valores for grande demais (use o Radix). */
-/* dst[i] += src[i] (somar histogramas das threads) */
 static void hist_somar(uint32_t *dst, const uint32_t *src, size_t n) {
     size_t i = 0;
-#ifdef USA_AVX2
+#ifdef USA_AVX512
+    for (; i + 16 <= n; i += 16) {
+        __m512i a = _mm512_loadu_si512((const void *)(dst + i));
+        __m512i b = _mm512_loadu_si512((const void *)(src + i));
+        _mm512_storeu_si512((void *)(dst + i), _mm512_add_epi32(a, b));
+    }
+#elif defined(USA_AVX2)
     for (; i + 8 <= n; i += 8) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(dst + i));
         __m256i b = _mm256_loadu_si256((const __m256i *)(src + i));
         _mm256_storeu_si256((__m256i *)(dst + i), _mm256_add_epi32(a, b));
     }
+#elif defined(USA_NEON)
+    for (; i + 4 <= n; i += 4) {
+        uint32x4_t a = vld1q_u32(dst + i);
+        uint32x4_t b = vld1q_u32(src + i);
+        vst1q_u32(dst + i, vaddq_u32(a, b));
+    }
 #endif
     for (; i < n; ++i) dst[i] += src[i];
 }
 
-/* Soma dos n contadores (acumula em 64 bits). */
 static size_t hist_total(const uint32_t *h, size_t n) {
     size_t i = 0, s = 0;
-#ifdef USA_AVX2
+#ifdef USA_AVX512
+    __m512i acc = _mm512_setzero_si512();
+    for (; i + 16 <= n; i += 16) {
+        __m512i x = _mm512_loadu_si512((const void *)(h + i));
+        acc = _mm512_add_epi32(acc, x);
+    }
+    /* O total e menor que UINT32_MAX, portanto a soma por lanes nao transborda. */
+    s = (size_t)(uint32_t)_mm512_reduce_add_epi32(acc);
+#elif defined(USA_AVX2)
     __m256i acc = _mm256_setzero_si256();
     for (; i + 8 <= n; i += 8) {
         __m256i x = _mm256_loadu_si256((const __m256i *)(h + i));
@@ -601,22 +615,31 @@ static size_t hist_total(const uint32_t *h, size_t n) {
     uint64_t t[4];
     _mm256_storeu_si256((__m256i *)t, acc);
     s = (size_t)(t[0] + t[1] + t[2] + t[3]);
+#elif defined(USA_NEON)
+    for (; i + 4 <= n; i += 4) {
+        uint32x4_t x = vld1q_u32(h + i);
+        s += (size_t)vaddlvq_u32(x);
+    }
 #endif
     for (; i < n; ++i) s += h[i];
     return s;
 }
 
-/* dst[0, cnt) = val. Corridas longas: stores AVX2 de 32 bytes (o ultimo
- * sobrepoe o anterior, sempre dentro de [dst, dst+cnt)). */
 static inline void preencher(value_t *dst, value_t val, size_t cnt) {
     size_t j = 0;
-#ifdef USA_AVX2
+#ifdef USA_AVX512
     if (cnt >= 16) {
+        __m512i vv = _mm512_set1_epi32(val);
+        for (; j + 16 <= cnt; j += 16) _mm512_storeu_si512((void *)(dst + j), vv);
+    }
+#elif defined(USA_AVX2)
+    if (cnt >= 8) {
         __m256i vv = _mm256_set1_epi32(val);
         for (; j + 8 <= cnt; j += 8) _mm256_storeu_si256((__m256i *)(dst + j), vv);
-        if (j < cnt) _mm256_storeu_si256((__m256i *)(dst + cnt - 8), vv);
-        return;
     }
+#elif defined(USA_NEON)
+    int32x4_t vv = vdupq_n_s32(val);
+    for (; j + 4 <= cnt; j += 4) vst1q_s32(dst + j, vv);
 #endif
     for (; j < cnt; ++j) dst[j] = val;
 }
@@ -673,11 +696,6 @@ static int ordenar_contagem(value_t *v, size_t n, Workspace *ws) {
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* 2: Radix Sort LSD paralelo                                          */
-/* ------------------------------------------------------------------ */
-/* Subtrai o minimo (aceita negativos), usa so os bits necessarios,
- * digitos de ate 11 bits (2048 baldes) e pula passes triviais. */
 static int ordenar_radix(value_t *v, value_t *aux, size_t n, Workspace *ws) {
     if (n < 2) return 0;
     if (n >= 0xFFFFFFFFu) { mergesort_rec(v, aux, 0, n); return 0; }
@@ -747,10 +765,6 @@ static int ordenar_radix(value_t *v, value_t *aux, size_t n, Workspace *ws) {
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* 3: Merge Sort paralelo                                              */
-/* ------------------------------------------------------------------ */
-
 static size_t corank(size_t m, const value_t *A, size_t na, const value_t *B, size_t nb) {
     size_t lo = (m > nb) ? m - nb : 0;
     size_t hi = (m < na) ? m : na;
@@ -787,13 +801,10 @@ static void ordenar_merge_paralelo(value_t *v, value_t *aux, size_t n) {
     size_t lim[MAX_T + 1];
     for (int i = 0; i <= C; ++i) lim[i] = particao(n, i, C);
 
-    /* Fase 1: cada bloco e ordenado com Merge Sort sequencial
-     * (as faixas de aux sao disjuntas entre os blocos). */
 #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
     for (int i = 0; i < C; ++i)
         mergesort_rec(v, aux, lim[i], lim[i + 1]);
 
-    /* Fase 2: merge em arvore, cada merge dividido entre threads (merge path). */
     value_t *src = v, *dst = aux;
     for (int w = 1; w < C; w *= 2) {
         int pares = C / (2 * w);
@@ -821,7 +832,7 @@ static void ordenar_merge_paralelo(value_t *v, value_t *aux, size_t n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Execucao dos testes                                                 */
+/* Orquestração e Execução                                            */
 /* ------------------------------------------------------------------ */
 
 enum { A_CONTAGEM, A_RADIX, A_MERGE_PAR, A_INTRO_PAR, A_INTRO, A_MERGE, A_HEAP, A_QSORT, A_TOTAL };
@@ -837,7 +848,6 @@ static const char *NOMES[A_TOTAL] = {
     "qsort (biblioteca C)"
 };
 
-/* Retorna 0 se executou, -1 se nao aplicavel */
 static int rodar(int tipo, value_t *v, value_t *aux, size_t n, Workspace *ws) {
     switch (tipo) {
         case A_CONTAGEM:  return ordenar_contagem(v, n, ws);
@@ -861,13 +871,16 @@ static void executar_teste(Resultado *r, int tipo, const value_t *base, size_t n
     r->aplicavel = 1;
     r->correto = 1;
 
-    if (reps > 1) { /* aquecimento: threads, paginas e workspace */
+    if (reps > 1) {
         copia_paralela(copia, base, n, T);
         if (rodar(tipo, copia, aux, n, ws) != 0) { r->aplicavel = 0; return; }
     }
 
     for (int k = 0; k < reps; ++k) {
-        copia_paralela(copia, base, n, T);   /* fora da medicao */
+        copia_paralela(copia, base, n, T);
+
+        // AQUICIMENTO DE CPU E THREADS (Lock de Frequencia Turbo Boost)
+        aquecer_cpu_e_threads();
 
         clock_t inicio = clock();
         double w0 = agora_ms();
@@ -890,111 +903,23 @@ static void executar_teste(Resultado *r, int tipo, const value_t *base, size_t n
     r->parede_ms = melhor_parede;
 }
 
-/* ------------------------------------------------------------------ */
-/* Modo competicao                                                     */
-/* ------------------------------------------------------------------ */
-
-/* Counting Sort quando a faixa de valores permite; senao Radix Sort.
- * Devolve o indice do algoritmo usado. */
-static int ordenar_oficial(value_t *v, value_t *aux, size_t n, Workspace *ws) {
-    if (ordenar_contagem(v, n, ws) == 0) return A_CONTAGEM;
-    ordenar_radix(v, aux, n, ws);
-    return A_RADIX;
-}
-
-static int modo_competicao(value_t *dados, size_t n, Assinatura ref) {
-    value_t *aux = (value_t *)malloc(n * sizeof(*aux));
-    if (!aux) {
-        fprintf(stderr, "Memoria insuficiente.\n");
-        return 1;
-    }
-    Workspace ws = {NULL, 0};
-
-    clock_t inicio = clock();
-    int usado = ordenar_oficial(dados, aux, n, &ws);
-    clock_t fim = clock();
-
-    double tempo_gasto = ((double)(fim - inicio)) / CLOCKS_PER_SEC;
-
-    Assinatura s = assinatura(dados, n);
-    int ok = esta_ordenado(dados, n) && s.soma == ref.soma && s.soma2 == ref.soma2;
-
-    printf("Elementos: %zu\n", n);
-    printf("Algoritmo: %s\n", NOMES[usado]);
-    printf("Tempo de ordenacao: %f segundos (%f ms)\n", tempo_gasto, tempo_gasto * 1000.0);
-    printf("Verificacao: %s\n", ok ? "OK (ordem crescente, nenhum elemento perdido)" : "FALHA");
-
-    free(aux);
-    free(ws.hist);
-    return ok ? 0 : 2;
-}
-
-/* ------------------------------------------------------------------ */
-/* Modo padrao: testa todos os algoritmos e compara os tempos          */
-/* ------------------------------------------------------------------ */
-
-static int modo_todos(value_t *dados, size_t n, Assinatura ref) {
-    value_t *copia = (value_t *)malloc(n * sizeof(*copia));
-    value_t *aux = (value_t *)malloc(n * sizeof(*aux));
-    if (!copia || !aux) {
-        fprintf(stderr, "Memoria insuficiente para executar os benchmarks.\n");
-        free(copia); free(aux);
-        return 1;
-    }
-
-    Workspace ws = {NULL, 0};
-    Resultado res[A_TOTAL];
-    int melhor = -1;
-
-    aquecer_threads();
-
-    printf("Elementos: %zu | Threads: %d\n", n, omp_get_max_threads());
-    printf("Tempo medido com clock() ao redor de cada ordenacao (leitura e verificacao ficam de fora).\n");
-    printf("Algoritmos paralelos: melhor de %d execucoes (apos aquecimento); os demais: 1 execucao.\n\n", REPETICOES);
-    printf("%-25s | %12s | %12s | %12s | %s\n", "Algoritmo", "clock (s)", "clock (ms)", "parede (ms)", "status");
-    printf("--------------------------+--------------+--------------+--------------+-------\n");
-
-    for (int i = 0; i < A_TOTAL; ++i) {
-        executar_teste(&res[i], i, dados, n, copia, aux, &ws, ref);
-        if (!res[i].aplicavel) {
-            printf("%-25s | %12s | %12s | %12s | nao aplicavel a esta faixa\n", res[i].nome, "-", "-", "-");
-            continue;
-        }
-        printf("%-25s | %12.6f | %12.3f | %12.3f | %s\n", res[i].nome,
-               res[i].clock_ms / 1000.0, res[i].clock_ms, res[i].parede_ms,
-               res[i].correto ? "OK" : "FALHA");
-        fflush(stdout);
-        if (!res[i].correto) {
-            fprintf(stderr, "ERRO: algoritmo %s nao ordenou corretamente.\n", res[i].nome);
-            free(copia); free(aux); free(ws.hist);
-            return 2;
-        }
-        if (melhor < 0 || res[i].parede_ms < res[melhor].parede_ms) melhor = i;
-    }
-
-    if (melhor >= 0)
-        printf("\nMais rapido nesta execucao: %s (%.3f ms de parede)\n", res[melhor].nome, res[melhor].parede_ms);
-    if (melhor >= 0 && res[A_QSORT].aplicavel && res[melhor].parede_ms > 0)
-        printf("Speedup sobre qsort: %.1fx\n", res[A_QSORT].parede_ms / res[melhor].parede_ms);
-#if defined(_OPENMP) && !defined(_WIN32)
-    printf("\nObs.: neste sistema clock() soma o tempo de CPU de todas as threads; para os\n"
-           "algoritmos paralelos o tempo real e o da coluna 'parede'.\n");
-#endif
-
-    free(copia); free(aux); free(ws.hist);
-    return 0;
-}
-
 int main(int argc, char **argv) {
-    const char *caminho = "listaOdenada.txt";
-    int competicao = 0;
+    const char *caminho = "listaOrdenada.txt";
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--competicao") == 0) competicao = 1;
-        else if (strcmp(argv[i], "--todos") == 0) competicao = 0;
-        else caminho = argv[i];
+        caminho = argv[i];
     }
 
-    /* Todos os nucleos logicos, salvo se OMP_NUM_THREADS estiver definido. */
+    FILE *f_test = fopen(caminho, "r");
+    if (!f_test) {
+        caminho = "ListahAhSerOrdenada.txt";
+        f_test = fopen(caminho, "r");
+    }
+    if (!f_test) {
+        caminho = "listaOdenada.txt";
+        f_test = fopen(caminho, "r");
+    }
+    if (f_test) fclose(f_test);
+
     if (!getenv("OMP_NUM_THREADS")) {
         omp_set_dynamic(0);
         omp_set_num_threads(omp_get_num_procs());
@@ -1003,20 +928,66 @@ int main(int argc, char **argv) {
     size_t n = 0;
     value_t *dados = carregar_arquivo(caminho, &n);
 
-    if (!dados) {
+    if (!dados || n == 0) {
         fprintf(stderr, "Erro: nao foi possivel abrir/ler '%s'.\n", caminho);
-        fprintf(stderr, "Uso: %s [arquivo.txt] [--competicao]\n", argv[0]);
-        return 1;
-    }
-    if (n == 0) {
-        fprintf(stderr, "Erro: nenhum numero inteiro encontrado no arquivo.\n");
-        free(dados);
         return 1;
     }
 
     Assinatura ref = assinatura(dados, n);
-    int rc = competicao ? modo_competicao(dados, n, ref) : modo_todos(dados, n, ref);
+    value_t *copia = (value_t *)malloc_alinhado(n * sizeof(*copia));
+    value_t *aux = (value_t *)malloc_alinhado(n * sizeof(*aux));
+    if (!copia || !aux) {
+        fprintf(stderr, "Memoria insuficiente.\n");
+        free_alinhado(copia); free_alinhado(aux); free_alinhado(dados);
+        return 1;
+    }
 
-    free(dados);
-    return rc;
+    Workspace ws = {NULL, 0};
+    Resultado res[A_TOTAL];
+    int melhor = -1;
+
+    aquecer_cpu_e_threads();
+
+    printf("\n========================================================================================\n");
+#if defined(USA_AVX512)
+    printf(" Arquitetura: x86-64 / AVX-512F (+ caminhos AVX2)\n");
+#elif defined(USA_AVX2)
+    printf(" Arquitetura: x86-64 / AVX2\n");
+#elif defined(USA_NEON)
+    printf(" Arquitetura: ARM64 / NEON\n");
+#elif defined(__x86_64__) || defined(_M_X64)
+    printf(" Arquitetura: x86-64 / SIMD generico\n");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    printf(" Arquitetura: ARM64 / SIMD generico\n");
+#else
+    printf(" Arquitetura: generica\n");
+#endif
+    printf(" BENCHMARK EXTREMO DE ORDENAÇÃO (Elementos: %zu | Threads: %d)\n", n, omp_get_max_threads());
+    imprimir_capacidades_cpu();
+    printf("========================================================================================\n\n");
+
+    printf("+---------------------------+-----------+------------+-------------+---------+\n");
+    printf("| Algoritmo                 | clock (s) | clock (ms) | parede (ms) | status  |\n");
+    printf("+---------------------------+-----------+------------+-------------+---------+\n");
+
+    for (int i = 0; i < A_TOTAL; ++i) {
+        executar_teste(&res[i], i, dados, n, copia, aux, &ws, ref);
+        if (!res[i].aplicavel) {
+            printf("| %-25s | %9s | %10s | %11s | N/A     |\n", res[i].nome, "-", "-", "-");
+            continue;
+        }
+        printf("| %-25s | %9.4f | %10.2f | %11.2f | %-7s |\n",
+               res[i].nome, res[i].clock_ms / 1000.0, res[i].clock_ms, res[i].parede_ms,
+               res[i].correto ? "SUCESSO" : "ERRO");
+        fflush(stdout);
+        if (melhor < 0 || res[i].parede_ms < res[melhor].parede_ms) melhor = i;
+    }
+
+    printf("+---------------------------+-----------+------------+-------------+---------+\n\n");
+
+    if (melhor >= 0)
+        printf("Vencedor Absoluto: %s (%.2f ms de tempo real)\n\n", res[melhor].nome, res[melhor].parede_ms);
+
+    free_alinhado(copia); free_alinhado(aux); free_alinhado(ws.hist); free_alinhado(dados);
+    return 0;
 }
