@@ -967,7 +967,7 @@ int main(int argc, char **argv) {
     printf("========================================================================================\n\n");
 
     printf("+---------------------------+-----------+------------+-------------+---------+\n");
-    printf("| Algoritmo                 | clock (s) | clock (ms) | parede (ms) | status  |\n");
+    printf("| Algoritmo                 | clock (s) | clock (ms) |  Tempo (ms) | status  |\n");
     printf("+---------------------------+-----------+------------+-------------+---------+\n");
 
     for (int i = 0; i < A_TOTAL; ++i) {
