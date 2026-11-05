@@ -1,103 +1,200 @@
-# Competição de Ordenação - O Desafio dos Milissegundos
-Programa em C que lê uma lista grande de números inteiros de um arquivo de texto e a ordena o mais rápido possível usando Counting Sort paralelo com OpenMP. No final, mostra o tipo de ordenação, a quantidade de elementos, o número de threads usadas e o tempo gasto em milissegundos.
+# Competição de Ordenação — O Desafio dos Milissegundos
 
-Como funciona
+Programa em C altamente otimizado que lê uma lista grande de números inteiros de um arquivo de texto e executa um benchmark completo entre diversos algoritmos de ordenação, destacando o Counting Sort e Radix Sort paralelos implementados com OpenMP.
 
-O Counting Sort não compara elementos entre si. Ele conta quantas vezes cada valor aparece e depois reescreve a lista já em ordem. Isso é muito mais rápido que quicksort ou mergesort quando os valores estão em uma faixa pequena, como na lista de teste (valores de 1 a 2.500.000).
+No modo padrão (benchmark completo), o programa testa todos os algoritmos suportados, realiza execuções de aquecimento (warm-up), mede o tempo de CPU (`clock()`) e de parede (`omp_get_wtime()`) de cada um, exibe a quantidade de elementos, o número de threads utilizadas e a comparação de desempenho. No modo competição (`--competicao`), executa o algoritmo mais adequado para a faixa de valores informada.
 
-A versão paralela divide o trabalho entre as threads em quatro fases:
+Ao final, o programa valida silenciosamente a ordenação e a integridade dos dados (soma e soma dos quadrados dos elementos).
 
-Cada thread conta os valores do seu bloco da lista em um histograma próprio.
-Cada thread soma os histogramas de todas as threads em uma fatia da faixa de valores.
-Um pequeno cálculo de prefixo define onde cada fatia começa na lista final.
-Cada thread escreve sua fatia já ordenada no vetor final.
+## Como Funciona
 
-Outros detalhes:
+### Algoritmos Testados
 
-A leitura do arquivo também é paralela.
-Aceita números negativos, pois o programa subtrai o menor valor da lista antes de contar.
-O tempo é medido com relógio de parede (omp_get_wtime), somente na ordenação.
-Antes da medição há uma execução de aquecimento, que não aparece na tela.
-Ao final, o programa confere em silêncio se a lista está em ordem crescente e se a soma e a soma dos quadrados batem com as do original. Só escreve algo se der erro.
-Requisitos
-Compilador GCC com suporte a OpenMP (MinGW-w64, TDM-GCC ou GCC no Linux).
-O cl do Visual Studio também funciona, usando /openmp no lugar de -fopenmp.
+1. Counting Sort (paralelo): Algoritmo de contagem $O(n + \text{faixa})$, extremamente rápido para listas com amplitude pequena de valores (ex.: de 1 a 2.500.000).
 
-Para conferir se o GCC está instalado:
+2. Radix Sort LSD (paralelo): Algoritmo por dígitos $O(n \times \text{passes})$, que lida com qualquer inteiro de 32 bits em sub-passes paralelos.
 
+3. Merge Sort (paralelo): Divisão em blocos por thread e fusão em árvore utilizando particionamento *merge path*.
+
+4. Intro Sort (paralelo): Particionamento paralelo em múltiplos níveis com execução final de Intro Sort em cada bloco.
+
+5. Algoritmos Sequenciais de Referência: Intro Sort sequencial, Merge Sort sequencial, Heap Sort e `qsort` da biblioteca padrão C.
+
+### Fases do Counting Sort Paralelo
+
+1. Contagem Local: Cada thread conta os valores do seu bloco da lista em um histograma próprio.
+
+2. Redução: Cada thread soma os histogramas de todas as threads em uma fatia da faixa de valores.
+
+3. Cálculo de Prefixo: Um cálculo sequencial reduzido define o deslocamento de cada fatia na lista final.
+
+4. Escrita Paralela: Cada thread grava sua fatia já ordenada diretamente no vetor de destino.
+
+### Detalhes de Implementação e Otimização
+
+* Suporte AVX2 / x86-64-v3: Utiliza instruções vetoriais AVX2 quando suportadas pelo compilador/processador para min/max, somas e preenchimento de memória.
+
+* Leitura Paralela de Arquivo: Leitura e conversão rápida de inteiros dividida em blocos entre as threads.
+
+* Suporte a Números Negativos: O programa calcula o menor valor da lista e aplica o deslocamento necessário antes da contagem ou ordenação por dígitos.
+
+* Medição de Tempo Precisa: Medição isolada estritamente na etapa de ordenação. Utiliza `omp_get_wtime()` para tempo de parede (tempo real decorrido) e `clock()` para tempo de CPU.
+
+* Aquecimento (Warm-up): Realiza execuções prévias para aquecimento de threads, tabelas de página e cache de memória antes de registrar a medição oficial (retendo o menor tempo entre 7 repetições nos algoritmos paralelos).
+
+* Validação de Integridade: Confere se o resultado final está em ordem crescente e se a soma total e a soma dos quadrados batem com os valores originais.
+
+## Medição de Tempo e Precisão
+
+Para garantir medições de milissegundos precisas e justas entre abordagens paralelas e sequenciais:
+
+* Relógio de Parede (`omp_get_wtime()`): Mede o tempo decorrido real. Em sistemas Linux e macOS, o `clock()` padrão da C stdlib acumula o tempo de CPU de todas as threads ativas (ex.: 8 threads rodando por 10 ms reportam 80 ms de CPU). O `omp_get_wtime()` corrige essa distorção refletindo o tempo real percebido pelo utilizador.
+
+* Precisão no Windows: O `clock()` no Windows possui resolução limitada (1 ms). O uso de `omp_get_wtime()` garante resolução de alta precisão (sub-milissegundo).
+
+* Execução de Aquecimento (Warm-up): A primeira execução de um algoritmo é descartada para evitar variações causadas pela alocação de memória, agendamento inicial de threads e carregamento de cache.
+
+* Menor Tempo de N Execuções: O programa repete os testes paralelos 7 vezes e reporta o menor tempo medido, eliminando ruídos causados por outros processos do sistema operacional.
+
+## Requisitos
+
+* Compilador GCC com suporte a OpenMP (MinGW-w64 no Windows ou GCC nativo no Linux).
+
+* O compilador `cl` do Visual Studio (MSVC) também é suportado.
+
+Para verificar se o GCC está instalado:
+
+```
 gcc --version
-Compilar e executar
+```
 
-No terminal, dentro da pasta do projeto:
+## Compilação e Execução
 
-gcc -O3 -march=native -fopenmp benchmark_ordenacao.c -o benchmark
+### Via Terminal (GCC / Linux ou Windows)
 
-Executar passando o arquivo de dados:
+Compilar com otimizações máximas e suporte a OpenMP:
 
-benchmark listaOdenada.txt
+```
+gcc -O3 -march=x86-64-v3 -funroll-loops -flto -fopenmp DiversosSorts_1.c -o DiversosSorts
+```
 
-No PowerShell, use .\benchmark.exe listaOdenada.txt. Se nenhum arquivo for informado, o programa tenta abrir listaOdenada.txt na pasta atual.
+Para compiladores mais antigos sem suporte ao target `x86-64-v3`:
 
-Com Visual Studio (Developer Command Prompt):
+```
+gcc -O3 -mavx2 -mbmi -mbmi2 -mlzcnt -mfma -fopenmp DiversosSorts_1.c -o DiversosSorts
+```
 
-cl /O2 /openmp /arch:AVX2 benchmark_ordenacao.c
-Usando a extensão C/C++ Compile Run no VS Code
+### Rodar o Benchmark Completo (Todos os Algoritmos)
 
-Sem criar pasta de projeto nem tasks.json, configure em Ctrl+, (Configurações):
+```
+# Linux / Bash
+./DiversosSorts listaOdenada.txt
 
-Configuração	Valor
-c-cpp-compile-run.c-flags	-O3 -march=native -fopenmp
-c-cpp-compile-run.c-linker-flags	-fopenmp
-c-cpp-compile-run.run-args	listaOdenada.txt (ou o caminho completo)
-c-cpp-compile-run.skip-if-compiled	desmarcado
+# PowerShell / CMD (Windows)
+.\DiversosSorts.exe listaOdenada.txt
+```
 
-Depois, com o arquivo .c aberto, aperte F6 para compilar e rodar. A opção skip-if-compiled precisa ficar desligada, senão a extensão pode reaproveitar um executável antigo feito sem OpenMP.
+*(Se nenhum arquivo for informado, o programa tenta abrir `listaOdenada.txt` por padrão).*
 
-Exemplo de saída
-Ordenacao: Counting Sort (paralelo)
+### Rodar no Modo Competição (Apenas o Algoritmo Ideal)
+
+```
+.\DiversosSorts.exe listaOdenada.txt --competicao
+```
+
+### Via Visual Studio (Developer Command Prompt)
+
+```
+cl /O2 /openmp /arch:AVX2 DiversosSorts_1.c
+```
+
+### Via Extensão C/C++ Compile Run no VS Code
+
+Em Ctrl + , (Configurações), configure apenas estas opções:
+
+| Configuração | Valor |
+| --- | --- |
+| `c-cpp-compile-run.c-flags` | `-O3 -march=native -fopenmp` |
+| `c-cpp-compile-run.c-linker-flags` | `-fopenmp` |
+
+Com o arquivo `.c` aberto, pressione F6 para compilar e rodar.
+
+## Exemplo de Saída
+
+### Modo Benchmark Completo (`--todos`)
+
+```
+Elementos: 10000000 | Threads: 8
+Tempo medido com clock() ao redor de cada ordenacao (leitura e verificacao ficam de fora).
+Algoritmos paralelos: melhor de 7 execucoes (apos aquecimento); os demais: 1 execucao.
+
+Algoritmo                 |    clock (s) |   clock (ms) |  parede (ms) | status
+--------------------------+--------------+--------------+--------------+-------
+Counting Sort (paralelo)  |     0.184000 |      184.000 |       24.120 | OK
+Radix Sort LSD (paralelo) |     0.312000 |      312.000 |       41.500 | OK
+Merge Sort (paralelo)     |     0.840000 |      840.000 |      112.300 | OK
+Intro Sort (paralelo)     |     1.120000 |     1120.000 |      148.900 | OK
+Intro Sort (sequencial)   |     0.680000 |      680.000 |      680.100 | OK
+Merge Sort (sequencial)   |     0.890000 |      890.000 |      890.400 | OK
+Heap Sort                 |     1.750000 |     1750.000 |     1750.200 | OK
+qsort (biblioteca C)      |     1.210000 |     1210.000 |     1210.500 | OK
+
+Mais rapido nesta execucao: Counting Sort (paralelo) (24.120 ms de parede)
+Speedup sobre qsort: 50.2x
+```
+
+### Modo Competição (`--competicao`)
+
+```
 Elementos: 10000000
-Threads:   8
-Tempo:     36.164 ms
+Algoritmo: Counting Sort (paralelo)
+Tempo de ordenacao: 0.024120 segundos (24.120 ms)
+Verificacao: OK (ordem crescente, nenhum elemento perdido)
+```
 
-Os valores acima são só um exemplo. O tempo e o número de threads dependem da sua máquina.
+## Formato do Arquivo de Entrada
 
-Formato do arquivo de entrada
+Arquivo de texto simples contendo números inteiros separados por espaço ou quebra de linha:
 
-Arquivo de texto com números inteiros separados por quebra de linha ou espaço. Exemplo:
-
+```
 5
 3
 10
 1
-Limitações
-O Counting Sort usa um histograma por thread. Se a faixa de valores (maior menos menor) for grande demais, a memória necessária passa de cerca de 512 MB e o programa para com uma mensagem de erro. Com a lista de teste (faixa de 2,5 milhões) isso não acontece.
-Funciona com inteiros de 32 bits (int).
-Listas com mais de 4 bilhões de elementos não são suportadas.
-Problemas comuns
+```
 
-Aparece Threads: 1
+## Limitações
 
-O programa foi compilado sem OpenMP ou o executável é antigo.
+* O Counting Sort aloca memória para os histogramas de cada thread. Se a amplitude de valores (`máximo - mínimo`) exceder o orçamento estipulado (~512 MB), o programa alterna automaticamente para o Radix Sort ou reporta que não é aplicável.
 
-Compile com -fopenmp.
-Apague o .exe antigo e compile de novo.
-Desative skip-if-compiled se estiver usando a extensão do VS Code.
-Confira se a variável OMP_NUM_THREADS não está definida como 1. No PowerShell: echo $env:OMP_NUM_THREADS. Para limpar: Remove-Item Env:OMP_NUM_THREADS.
+* Projetado para inteiros de 32 bits (`int`).
 
-gcc is not recognized
+* Suporta vetores até o limite de memória disponível da máquina (vetores acima de 4 bilhões de elementos exigem adaptações de tipos de 64 bits em todas as fases).
 
-O GCC não está no PATH do Windows. Instale o MinGW-w64 (por exemplo, via MSYS2), adicione a pasta bin ao PATH e reinicie o VS Code.
+## Problemas Comuns (FAQ)
 
-Erro: faixa de valores grande demais
+### Aparece Threads: 1
 
-Os números da lista estão muito espalhados para o Counting Sort. Esse algoritmo só serve para listas com valores em uma faixa limitada.
+O programa foi compilado sem a flag de OpenMP. Certifique-se de incluir `-fopenmp` (GCC) ou `/openmp` (MSVC) na compilação.
+Verifique se a variável de ambiente `OMP_NUM_THREADS` não está forçada para 1. No PowerShell: `Remove-Item Env:OMP_NUM_THREADS`.
 
-Erro: nao foi possivel abrir/ler
+### gcc is not recognized
 
-Confira se o nome e o caminho do arquivo de dados estão corretos.
+O GCC não está no PATH do sistema. Instale o MinGW-w64 e adicione o diretório `bin` às variáveis de ambiente.
 
-Estrutura
+### Erro: faixa de valores grande demais
+
+Notificação emitida quando o Counting Sort não pode ser aplicado devido ao tamanho da amplitude de dados. O benchmark ignora o Counting Sort e utiliza o Radix Sort nestes casos.
+
+### Erro: nao foi possivel abrir/ler
+
+O caminho ou nome do arquivo de dados informado no argumento não foi encontrado no diretório.
+
+## Estrutura do Projeto
+
+```
 .
-├── benchmark_ordenacao.c   # código-fonte
-├── listaOdenada.txt        # lista de números a ordenar
-└── README.md
+├── DiversosSorts_1.c       # código-fonte C otimizado (OpenMP / AVX2)
+├── listaOdenada.txt        # lista de números para teste
+└── README.md               # documentação do projeto
+```
