@@ -1,39 +1,24 @@
 /*
- * Benchmark de ordenacao - versao paralela (OpenMP) e otimizada.
+ * Benchmark de ordenacao paralelo (OpenMP), alvo x86-64-v3 (AVX2/BMI2/LZCNT).
+ * Os kernels AVX2 so sao compilados se __AVX2__ estiver definido; senao usa
+ * as versoes escalares. No GCC o pragma abaixo liga o conjunto v3 sozinho;
+ * -DSEM_V3 desliga isso.
  *
- * Alvo x86-64-v3: AVX2 + BMI1/BMI2 + FMA + LZCNT + MOVBE + F16C (Intel Haswell /
- * AMD Excavator/Zen ou mais novos). Os kernels AVX2 sao compilados quando o
- * compilador define __AVX2__; sem isso o programa usa as versoes escalares.
+ * Compilar (GCC/Clang/MinGW):
+ *   gcc -O3 -march=x86-64-v3 -funroll-loops -flto -fopenmp DiversosSorts.c -o DiversosSorts
+ * Compilar (MSVC):
+ *   cl /O2 /openmp /arch:AVX2 DiversosSorts.c
  *
- * Compilar (GCC 11+ / Clang 12+ / MinGW-w64 / Linux):
- *   gcc -O3 -march=x86-64-v3 -funroll-loops -flto -fopenmp DiversosSorts_1.c -o DiversosSorts
- *   (GCC mais antigo: -mavx2 -mbmi -mbmi2 -mlzcnt -mfma -mmovbe -mf16c)
- *   No GCC, mesmo sem -march o proprio codigo liga o conjunto v3 (pragma);
- *   para desligar isso e usar so codigo escalar: -DSEM_V3
+ * Uso:
+ *   DiversosSorts [arquivo.txt] [--competicao]
+ *   (padrao: listaOdenada.txt, testa todos os algoritmos)
  *
- * Compilar (MSVC, Developer Command Prompt):
- *   cl /O2 /openmp /arch:AVX2 DiversosSorts_1.c
+ * So a ordenacao e cronometrada (clock() e omp_get_wtime); leitura do arquivo
+ * e verificacao ficam fora. No Linux/macOS clock() soma o CPU de todas as
+ * threads, por isso a coluna "parede" e o tempo real dos algoritmos paralelos.
  *
- * Executar (basta rodar: ja testa TODOS os algoritmos, sem precisar de flag):
- *   DiversosSorts                      (usa listaOdenada.txt)
- *   DiversosSorts outroArquivo.txt
- *   DiversosSorts outroArquivo.txt --competicao   (so o algoritmo mais adequado)
- *
- * Cada ordenacao e cronometrada com clock() imediatamente antes e depois da
- * chamada; a leitura do arquivo e a verificacao de corretude ficam fora da
- * medicao. Alem do clock() mostramos o tempo de parede (omp_get_wtime), que e o
- * tempo "real" quando ha varias threads (no Linux/macOS clock() soma o tempo de
- * CPU de todas as threads; no Windows ele e tempo de parede).
- *
- * Algoritmos:
- *   1) Counting Sort paralelo   - O(n + faixa), ideal quando os valores sao "pequenos"
- *   2) Radix Sort LSD paralelo  - O(n * passes), funciona para qualquer int de 32 bits
- *   3) Merge Sort paralelo      - Merge Sort por bloco + merge em arvore com
- *                                 particionamento "merge path"
- *   4) Intro Sort paralelo      - particiona em paralelo (nivel a nivel) e ordena
- *                                 os pedacos com Intro Sort, um por thread
- *   Para comparacao: Intro Sort, Merge Sort sequencial, Heap Sort e qsort da
- *   biblioteca C (estes sao sequenciais por natureza, usam 1 nucleo).
+ * Algoritmos: Counting Sort, Radix Sort LSD, Merge Sort e Intro Sort paralelos;
+ * Intro Sort, Merge Sort, Heap Sort e qsort sequenciais como referencia.
  */
 
 #include <stdio.h>
@@ -68,6 +53,8 @@ static void omp_set_dynamic(int d)     { (void)d; }
 #endif
 
 typedef int value_t;
+
+#define TROCA(a, b) do { value_t t_ = (a); (a) = (b); (b) = t_; } while (0)
 
 #define MAX_T 256
 #define MAX_SEG 1024 /* maximo de pedacos do Intro Sort paralelo */
@@ -146,8 +133,7 @@ static Assinatura assinatura(const value_t *v, size_t n) {
         s1 += x;
         s2 += x * x;
     }
-    Assinatura a = {s1, s2};
-    return a;
+    return (Assinatura){s1, s2};
 }
 
 /* Confere os pares (i-1, i) para i em [a, b). */
@@ -312,7 +298,7 @@ static value_t *carregar_arquivo(const char *caminho, size_t *n_out) {
     fclose(f);
     buf[lidos] = 0;
 
-    int T = ((size_t)lidos < ((size_t)1 << 20)) ? 1 : omp_get_max_threads();
+    int T = (lidos < ((size_t)1 << 20)) ? 1 : omp_get_max_threads();
     if (T > MAX_T) T = MAX_T;
 
     size_t cnt[MAX_T + 1], off[MAX_T + 1];
@@ -439,7 +425,7 @@ static void mergesort_rec(value_t *v, value_t *aux, size_t inicio, size_t fim) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Algoritmos classicos (referencia, usados no modo --todos)           */
+/* Algoritmos classicos (referencia)                                   */
 /* ------------------------------------------------------------------ */
 
 static int comparar_int(const void *a, const void *b) {
@@ -466,9 +452,7 @@ static void sift_down(value_t *v, size_t inicio, size_t n) {
         size_t filho = raiz * 2 + 1;
         if (filho + 1 < n && v[filho] < v[filho + 1]) ++filho;
         if (v[raiz] >= v[filho]) return;
-        value_t temp = v[raiz];
-        v[raiz] = v[filho];
-        v[filho] = temp;
+        TROCA(v[raiz], v[filho]);
         raiz = filho;
     }
 }
@@ -479,9 +463,7 @@ static void heapsort_intervalo(value_t *v, size_t inicio, size_t fim) {
     for (size_t i = n / 2; i > 0; --i)
         sift_down(v + inicio, i - 1, n);
     for (size_t fim_heap = n; fim_heap > 1; --fim_heap) {
-        value_t temp = v[inicio];
-        v[inicio] = v[inicio + fim_heap - 1];
-        v[inicio + fim_heap - 1] = temp;
+        TROCA(v[inicio], v[inicio + fim_heap - 1]);
         sift_down(v + inicio, 0, fim_heap - 1);
     }
 }
@@ -491,9 +473,9 @@ static void heapsort_intervalo(value_t *v, size_t inicio, size_t fim) {
 static size_t particionar(value_t *v, size_t inicio, size_t fim) {
     size_t meio = inicio + (fim - inicio) / 2;
     size_t ultimo = fim - 1;
-    if (v[meio] < v[inicio]) { value_t t=v[meio]; v[meio]=v[inicio]; v[inicio]=t; }
-    if (v[ultimo] < v[meio]) { value_t t=v[ultimo]; v[ultimo]=v[meio]; v[meio]=t; }
-    if (v[meio] < v[inicio]) { value_t t=v[meio]; v[meio]=v[inicio]; v[inicio]=t; }
+    if (v[meio] < v[inicio])  TROCA(v[meio], v[inicio]);
+    if (v[ultimo] < v[meio])  TROCA(v[ultimo], v[meio]);
+    if (v[meio] < v[inicio])  TROCA(v[meio], v[inicio]);
     value_t pivo = v[meio];
 
     size_t i = inicio, j = fim - 1;
@@ -501,7 +483,7 @@ static size_t particionar(value_t *v, size_t inicio, size_t fim) {
         while (v[i] < pivo) ++i;
         while (v[j] > pivo) --j;
         if (i >= j) break;
-        value_t t = v[i]; v[i] = v[j]; v[j] = t;
+        TROCA(v[i], v[j]);
         ++i;
         if (j > 0) --j;
     }
@@ -526,7 +508,7 @@ static void introsort_rec(value_t *v, size_t inicio, size_t fim, int profundidad
             fim = corte;
         }
     }
-    if (fim > inicio) insertion_sort(v, inicio, fim);
+    insertion_sort(v, inicio, fim);
 }
 
 static int log2_piso(size_t x) {
@@ -887,18 +869,15 @@ static void executar_teste(Resultado *r, int tipo, const value_t *base, size_t n
     for (int k = 0; k < reps; ++k) {
         copia_paralela(copia, base, n, T);   /* fora da medicao */
 
-        /* --- inicio da medicao: somente a ordenacao --- */
         clock_t inicio = clock();
         double w0 = agora_ms();
         int rc = rodar(tipo, copia, aux, n, ws);
         double w1 = agora_ms();
         clock_t fim = clock();
-        /* --- fim da medicao --- */
 
         if (rc != 0) { r->aplicavel = 0; return; }
 
-        double tempo_gasto = ((double)(fim - inicio)) / CLOCKS_PER_SEC;
-        double ms_clock = tempo_gasto * 1000.0;
+        double ms_clock = 1000.0 * (double)(fim - inicio) / CLOCKS_PER_SEC;
         double ms_parede = w1 - w0;
         if (ms_clock < melhor_clock) melhor_clock = ms_clock;
         if (ms_parede < melhor_parede) melhor_parede = ms_parede;
@@ -931,11 +910,9 @@ static int modo_competicao(value_t *dados, size_t n, Assinatura ref) {
     }
     Workspace ws = {NULL, 0};
 
-    /* --- inicio da medicao: somente a ordenacao --- */
     clock_t inicio = clock();
     int usado = ordenar_oficial(dados, aux, n, &ws);
     clock_t fim = clock();
-    /* --- fim da medicao --- */
 
     double tempo_gasto = ((double)(fim - inicio)) / CLOCKS_PER_SEC;
 
@@ -1013,18 +990,18 @@ int main(int argc, char **argv) {
     int competicao = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--competicao") == 0) competicao = 1;
-        else if (strcmp(argv[i], "--todos") == 0) competicao = 0; /* ja e o padrao */
+        else if (strcmp(argv[i], "--todos") == 0) competicao = 0;
         else caminho = argv[i];
     }
 
-    /* Usa todos os nucleos logicos (a menos que OMP_NUM_THREADS tenha sido definido). */
+    /* Todos os nucleos logicos, salvo se OMP_NUM_THREADS estiver definido. */
     if (!getenv("OMP_NUM_THREADS")) {
         omp_set_dynamic(0);
         omp_set_num_threads(omp_get_num_procs());
     }
 
     size_t n = 0;
-    value_t *dados = carregar_arquivo(caminho, &n);   /* leitura: fora da medicao */
+    value_t *dados = carregar_arquivo(caminho, &n);
 
     if (!dados) {
         fprintf(stderr, "Erro: nao foi possivel abrir/ler '%s'.\n", caminho);
